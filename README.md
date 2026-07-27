@@ -1,26 +1,40 @@
-# zapier-webhook
+# zapier-webhook v2
 
-Minimal Node.js 22 + Express webhook receiver intended for Railway.
+Receives structured GTD data from Zapier, writes it to `00 Inbox/AI Inbox.md`,
+and uses Obsidian Headless to sync the Railway volume with an existing
+Obsidian Sync remote vault.
 
-## Endpoints
+## Railway volume
 
-- `GET /health` → `{"status":"ok"}`
-- `POST /capture` → accepts JSON, logs it, and returns `{"success":true}`
+Mount a persistent Railway volume at `/data`.
 
-## Run locally
+## Required Railway variables
 
-```bash
-npm install
-npm start
-```
+- `CAPTURE_TOKEN` — long random secret shared only with Zapier
+- `OBSIDIAN_EMAIL` — Obsidian account email
+- `OBSIDIAN_PASSWORD` — Obsidian account password
+- `OBSIDIAN_REMOTE_VAULT` — exact name or ID of the existing remote Sync vault
 
-The app listens on `process.env.PORT`, falling back to port 3000 locally.
+Optional:
 
-## Current scope
+- `OBSIDIAN_E2E_PASSWORD` — only if the remote vault uses a separate E2E password
+- `OBSIDIAN_DEVICE_NAME` — defaults to `Railway AI Inbox`
+- `VAULT_PATH` — defaults to `/data/vault`
+- `INBOX_PATH` — defaults to `00 Inbox/AI Inbox.md`
 
-This initial version deliberately has:
-- no database
-- no authentication
-- no Obsidian integration
+## Webhook authentication
 
-Those can be added after the Zapier → Railway path is verified.
+Send either:
+
+`Authorization: Bearer YOUR_CAPTURE_TOKEN`
+
+or:
+
+`X-Capture-Token: YOUR_CAPTURE_TOKEN`
+
+to `POST /capture`.
+
+## Safety
+
+The service initially writes only to `00 Inbox/AI Inbox.md`; it does not edit
+project notes automatically.
