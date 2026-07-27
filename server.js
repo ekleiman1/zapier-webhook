@@ -29,9 +29,11 @@ let syncError = null;
 
 function requireEnv(name) {
   const value = process.env[name];
+
   if (!value) {
     throw new Error(`Missing required environment variable: ${name}`);
   }
+
   return value;
 }
 
@@ -47,20 +49,45 @@ async function setupObsidianSync() {
   const email = requireEnv("OBSIDIAN_EMAIL");
   const password = requireEnv("OBSIDIAN_PASSWORD");
   const remoteVault = requireEnv("OBSIDIAN_REMOTE_VAULT");
+
   const e2ePassword = process.env.OBSIDIAN_E2E_PASSWORD;
+
   const deviceName =
     process.env.OBSIDIAN_DEVICE_NAME || "Railway AI Inbox";
 
-  await fs.mkdir(VAULT_PATH, { recursive: true });
+  await fs.mkdir(VAULT_PATH, {
+    recursive: true,
+  });
 
-  runOb(["login", "--email", email, "--password", password]);
+  /*
+   Log into the Obsidian account.
+  */
+  runOb([
+    "login",
+    "--email",
+    email,
+    "--password",
+    password,
+  ]);
 
+  /*
+   Check whether this server-side path is already
+   connected to an Obsidian Sync remote vault.
+  */
   let localVaults = "";
 
   try {
-    localVaults = runOb(["sync-list-local"]);
-  } catch (_) {}
+    localVaults = runOb([
+      "sync-list-local",
+    ]);
+  } catch (_) {
+    // First-time setup may not yet have a local vault.
+  }
 
+  /*
+   If the Railway vault hasn't already been linked,
+   connect it to the existing remote vault.
+  */
   if (!localVaults.includes(VAULT_PATH)) {
     const args = [
       "sync-setup",
@@ -73,39 +100,79 @@ async function setupObsidianSync() {
     ];
 
     if (e2ePassword) {
-      args.push("--password", e2ePassword);
+      args.push(
+        "--password",
+        e2ePassword
+      );
     }
 
     runOb(args);
   }
 
-  // Initial sync before accepting writes
-  runOb(["sync", "--path", VAULT_PATH]);
+  /*
+   IMPORTANT:
+   Do NOT run a separate one-time "ob sync" here.
+
+   We use the continuous sync process below as the
+   only sync instance for this vault.
+  */
 
   syncProcess = spawn(
     "ob",
-    ["sync", "--path", VAULT_PATH, "--continuous"],
+    [
+      "sync",
+      "--path",
+      VAULT_PATH,
+      "--continuous",
+    ],
     {
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [
+        "ignore",
+        "pipe",
+        "pipe",
+      ],
     }
   );
 
-  syncProcess.stdout.on("data", (d) =>
-    console.log(`[obsidian-sync] ${d.toString().trim()}`)
+  syncProcess.stdout.on(
+    "data",
+    (data) => {
+      console.log(
+        `[obsidian-sync] ${data
+          .toString()
+          .trim()}`
+      );
+    }
   );
 
-  syncProcess.stderr.on("data", (d) =>
-    console.error(`[obsidian-sync] ${d.toString().trim()}`)
+  syncProcess.stderr.on(
+    "data",
+    (data) => {
+      console.error(
+        `[obsidian-sync] ${data
+          .toString()
+          .trim()}`
+      );
+    }
   );
 
-  syncProcess.on("exit", (code, signal) => {
-    syncReady = false;
-    syncError =
-      `Obsidian sync exited (code=${code}, signal=${signal})`;
+  syncProcess.on(
+    "exit",
+    (code, signal) => {
+      syncReady = false;
 
-    console.error(syncError);
-  });
+      syncError =
+        `Obsidian sync exited ` +
+        `(code=${code}, signal=${signal})`;
 
+      console.error(syncError);
+    }
+  );
+
+  /*
+   Once the continuous process has launched,
+   treat Sync as available.
+  */
   syncReady = true;
   syncError = null;
 }
@@ -115,26 +182,36 @@ async function setupObsidianSync() {
 ------------------------------ */
 
 function authCapture(req, res, next) {
-  const expected = process.env.CAPTURE_TOKEN;
+  const expected =
+    process.env.CAPTURE_TOKEN;
 
   if (!expected) {
-    return res.status(503).json({
-      success: false,
-      error: "CAPTURE_TOKEN not configured",
-    });
+    return res
+      .status(503)
+      .json({
+        success: false,
+        error:
+          "CAPTURE_TOKEN not configured",
+      });
   }
 
-  const auth = req.get("authorization") || "";
+  const auth =
+    req.get("authorization") || "";
 
-  const supplied = auth.startsWith("Bearer ")
-    ? auth.slice(7)
-    : req.get("x-capture-token");
+  const supplied =
+    auth.startsWith("Bearer ")
+      ? auth.slice(7)
+      : req.get(
+          "x-capture-token"
+        );
 
   if (supplied !== expected) {
-    return res.status(401).json({
-      success: false,
-      error: "Unauthorized",
-    });
+    return res
+      .status(401)
+      .json({
+        success: false,
+        error: "Unauthorized",
+      });
   }
 
   next();
@@ -159,18 +236,21 @@ function clean(value) {
 function isTrue(value) {
   return (
     value === true ||
-    String(value).toLowerCase() === "true"
+    String(value).toLowerCase() ===
+      "true"
   );
 }
 
 /*
-Prevent project names from accidentally
-creating paths outside 01. Projects.
+ Prevent an AI-generated project name
+ from accidentally becoming a path.
 */
 function safeProjectName(name) {
   const cleaned = clean(name);
 
-  if (!cleaned) return null;
+  if (!cleaned) {
+    return null;
+  }
 
   return cleaned
     .replace(/[\/\\]/g, "-")
@@ -182,17 +262,35 @@ function safeProjectName(name) {
    AI Inbox rendering
 ------------------------------ */
 
-function renderInboxCapture(body, filedProject = null) {
-  const timestamp = new Date().toISOString();
+function renderInboxCapture(
+  body,
+  filedProject = null
+) {
+  const timestamp =
+    new Date().toISOString();
 
   const classification =
-    clean(body.classification) || "unknown";
+    clean(body.classification) ||
+    "unknown";
 
-  const summary = clean(body.summary);
+  const summary =
+    clean(body.summary);
 
-  const needsReview = isTrue(body.needs_review);
+  const needsReview =
+    isTrue(body.needs_review);
 
-  const reviewReason = clean(body.review_reason);
+  const reviewReason =
+    clean(body.review_reason);
+
+  const nextActions =
+    clean(
+      body.next_actions_markdown
+    );
+
+  const waitingFor =
+    clean(
+      body.waiting_for_markdown
+    );
 
   const lines = [
     "",
@@ -205,14 +303,20 @@ function renderInboxCapture(body, filedProject = null) {
     lines.push(
       `**Filed to:** [[${filedProject}]]`
     );
-  } else if (clean(body.project)) {
+  } else if (
+    clean(body.project)
+  ) {
     lines.push(
-      `**Suggested project:** [[${clean(body.project)}]]`
+      `**Suggested project:** [[${clean(
+        body.project
+      )}]]`
     );
   }
 
   if (summary) {
-    lines.push(`**Summary:** ${summary}`);
+    lines.push(
+      `**Summary:** ${summary}`
+    );
   }
 
   if (needsReview) {
@@ -225,17 +329,10 @@ function renderInboxCapture(body, filedProject = null) {
   }
 
   /*
-  If the item is staying in the inbox,
-  include the actual task/waiting text.
+   If the item stays in the inbox,
+   include its actual task content.
   */
-
   if (!filedProject) {
-    const nextActions =
-      clean(body.next_actions_markdown);
-
-    const waitingFor =
-      clean(body.waiting_for_markdown);
-
     if (nextActions) {
       lines.push(
         "",
@@ -252,7 +349,10 @@ function renderInboxCapture(body, filedProject = null) {
       );
     }
 
-    if (!nextActions && !waitingFor) {
+    if (
+      !nextActions &&
+      !waitingFor
+    ) {
       lines.push(
         "",
         "_No task or waiting-for item created._"
@@ -260,14 +360,18 @@ function renderInboxCapture(body, filedProject = null) {
     }
   }
 
-  return lines.join("\n") + "\n";
+  return (
+    lines.join("\n") + "\n"
+  );
 }
 
 /* -----------------------------
    Project handling
 ------------------------------ */
 
-async function projectExists(projectPath) {
+async function projectExists(
+  projectPath
+) {
   try {
     await fs.access(projectPath);
     return true;
@@ -276,44 +380,67 @@ async function projectExists(projectPath) {
   }
 }
 
-async function createProject(projectName, projectPath) {
-  await fs.mkdir(path.dirname(projectPath), {
-    recursive: true,
-  });
-
-  const templatePath = path.join(
-    VAULT_PATH,
-    PROJECT_TEMPLATE_RELATIVE_PATH
+async function createProject(
+  projectName,
+  projectPath
+) {
+  await fs.mkdir(
+    path.dirname(projectPath),
+    {
+      recursive: true,
+    }
   );
+
+  const templatePath =
+    path.join(
+      VAULT_PATH,
+      PROJECT_TEMPLATE_RELATIVE_PATH
+    );
 
   let content;
 
   try {
-    content = await fs.readFile(
-      templatePath,
-      "utf8"
-    );
+    content =
+      await fs.readFile(
+        templatePath,
+        "utf8"
+      );
 
     /*
-    Support a few common template placeholders
-    if they're present.
+     Replace common title placeholders
+     if your template contains them.
     */
     content = content
-      .replace(/\{\{title\}\}/gi, projectName)
-      .replace(/\{\{project\}\}/gi, projectName)
-      .replace(/\{\{name\}\}/gi, projectName);
+      .replace(
+        /\{\{title\}\}/gi,
+        projectName
+      )
+      .replace(
+        /\{\{project\}\}/gi,
+        projectName
+      )
+      .replace(
+        /\{\{name\}\}/gi,
+        projectName
+      );
 
     /*
-    If template doesn't appear to contain
-    the project title, add it.
+     If the template doesn't contain
+     the project name, add a heading.
     */
-    if (!content.includes(projectName)) {
+    if (
+      !content.includes(
+        projectName
+      )
+    ) {
       content =
-        `# ${projectName}\n\n` + content;
+        `# ${projectName}\n\n` +
+        content;
     }
   } catch (_) {
     /*
-    Fallback if the template isn't found.
+     Fallback project format if
+     the template cannot be found.
     */
     content =
       `# ${projectName}\n\n` +
@@ -338,15 +465,21 @@ async function appendToProject(
   projectPath,
   body
 ) {
-  const timestamp = new Date().toISOString();
+  const timestamp =
+    new Date().toISOString();
 
   const nextActions =
-    clean(body.next_actions_markdown);
+    clean(
+      body.next_actions_markdown
+    );
 
   const waitingFor =
-    clean(body.waiting_for_markdown);
+    clean(
+      body.waiting_for_markdown
+    );
 
-  const summary = clean(body.summary);
+  const summary =
+    clean(body.summary);
 
   const lines = [
     "",
@@ -355,7 +488,9 @@ async function appendToProject(
   ];
 
   if (summary) {
-    lines.push(`**Summary:** ${summary}`);
+    lines.push(
+      `**Summary:** ${summary}`
+    );
   }
 
   if (nextActions) {
@@ -374,7 +509,10 @@ async function appendToProject(
     );
   }
 
-  if (!nextActions && !waitingFor) {
+  if (
+    !nextActions &&
+    !waitingFor
+  ) {
     lines.push(
       "",
       "_No task or waiting-for item created._"
@@ -394,24 +532,31 @@ async function appendToProject(
 
 async function fileCapture(body) {
   const projectName =
-    safeProjectName(body.project);
+    safeProjectName(
+      body.project
+    );
 
   const needsReview =
-    isTrue(body.needs_review);
+    isTrue(
+      body.needs_review
+    );
 
-  const inboxPath = path.join(
-    VAULT_PATH,
-    INBOX_RELATIVE_PATH
-  );
+  const inboxPath =
+    path.join(
+      VAULT_PATH,
+      INBOX_RELATIVE_PATH
+    );
 
   await fs.mkdir(
     path.dirname(inboxPath),
-    { recursive: true }
+    {
+      recursive: true,
+    }
   );
 
   /*
-  Anything requiring human review
-  stays in AI Inbox.
+   Anything requiring human review
+   stays in AI Inbox.
   */
   if (needsReview) {
     await fs.appendFile(
@@ -421,15 +566,16 @@ async function fileCapture(body) {
     );
 
     return {
-      destination: INBOX_RELATIVE_PATH,
+      destination:
+        INBOX_RELATIVE_PATH,
       project: null,
       reason: "needs_review",
     };
   }
 
   /*
-  No project identified:
-  leave in AI Inbox.
+   If no project was identified,
+   keep it in AI Inbox.
   */
   if (!projectName) {
     await fs.appendFile(
@@ -439,29 +585,37 @@ async function fileCapture(body) {
     );
 
     return {
-      destination: INBOX_RELATIVE_PATH,
+      destination:
+        INBOX_RELATIVE_PATH,
       project: null,
       reason: "no_project",
     };
   }
 
   /*
-  Project identified.
+   Build the project note path.
   */
-  const projectRelativePath = path.join(
-    PROJECTS_RELATIVE_PATH,
-    `${projectName}.md`
-  );
+  const projectRelativePath =
+    path.join(
+      PROJECTS_RELATIVE_PATH,
+      `${projectName}.md`
+    );
 
-  const projectPath = path.join(
-    VAULT_PATH,
-    projectRelativePath
-  );
+  const projectPath =
+    path.join(
+      VAULT_PATH,
+      projectRelativePath
+    );
 
   /*
-  Create project if necessary.
+   Create the project if it
+   doesn't already exist.
   */
-  if (!(await projectExists(projectPath))) {
+  if (
+    !(await projectExists(
+      projectPath
+    ))
+  ) {
     await createProject(
       projectName,
       projectPath
@@ -469,8 +623,8 @@ async function fileCapture(body) {
   }
 
   /*
-  Add the actionable content
-  to the project.
+   Add this capture to the
+   appropriate project note.
   */
   await appendToProject(
     projectPath,
@@ -478,8 +632,8 @@ async function fileCapture(body) {
   );
 
   /*
-  Leave a lightweight audit record
-  in AI Inbox.
+   Leave a lightweight audit
+   trail in AI Inbox.
   */
   await fs.appendFile(
     inboxPath,
@@ -491,8 +645,10 @@ async function fileCapture(body) {
   );
 
   return {
-    destination: projectRelativePath,
-    project: projectName,
+    destination:
+      projectRelativePath,
+    project:
+      projectName,
     reason: "project",
   };
 }
@@ -501,13 +657,18 @@ async function fileCapture(body) {
    Routes
 ------------------------------ */
 
-app.get("/health", (_req, res) => {
-  res.status(200).json({
-    status: "ok",
-    sync_ready: syncReady,
-    sync_error: syncError,
-  });
-});
+app.get(
+  "/health",
+  (_req, res) => {
+    res.status(200).json({
+      status: "ok",
+      sync_ready:
+        syncReady,
+      sync_error:
+        syncError,
+    });
+  }
+);
 
 app.post(
   "/capture",
@@ -515,21 +676,28 @@ app.post(
   async (req, res) => {
     try {
       if (!syncReady) {
-        return res.status(503).json({
-          success: false,
-          error:
-            "Obsidian Sync is not ready",
-          detail: syncError,
-        });
+        return res
+          .status(503)
+          .json({
+            success: false,
+            error:
+              "Obsidian Sync is not ready",
+            detail:
+              syncError,
+          });
       }
 
       console.log(
         "Capture received:",
-        JSON.stringify(req.body)
+        JSON.stringify(
+          req.body
+        )
       );
 
       const result =
-        await fileCapture(req.body);
+        await fileCapture(
+          req.body
+        );
 
       console.log(
         "Capture filed:",
@@ -546,10 +714,13 @@ app.post(
         error
       );
 
-      res.status(500).json({
-        success: false,
-        error: error.message,
-      });
+      res
+        .status(500)
+        .json({
+          success: false,
+          error:
+            error.message,
+        });
     }
   }
 );
@@ -569,7 +740,8 @@ app.listen(
     setupObsidianSync().catch(
       (error) => {
         syncReady = false;
-        syncError = error.message;
+        syncError =
+          error.message;
 
         console.error(
           "Obsidian Sync setup failed:",
