@@ -1,7 +1,30 @@
 const express = require("express");
 const fs = require("fs/promises");
+const fsSync = require("fs");
 const path = require("path");
 const { spawn, execFileSync } = require("child_process");
+
+/*
+ Resolve the Obsidian CLI explicitly instead of trusting PATH.
+
+ `npm start` adds node_modules/.bin to PATH, but we deliberately
+ start with plain `node server.js` so signals reach this process
+ (npm swallows SIGTERM and exits non-zero, which Railway reports
+ as a crash). Resolving the binary here keeps us independent of
+ however the container chooses to launch us.
+*/
+const OB_BIN = (() => {
+  const local = path.join(
+    __dirname,
+    "node_modules",
+    ".bin",
+    "ob"
+  );
+
+  return fsSync.existsSync(local)
+    ? local
+    : "ob";
+})();
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -75,7 +98,7 @@ function requireEnv(name) {
 }
 
 function runOb(args, options = {}) {
-  return execFileSync("ob", args, {
+  return execFileSync(OB_BIN, args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     ...options,
@@ -148,7 +171,7 @@ async function setupObsidianSync() {
 function startSyncProcess() {
   return new Promise((resolve, reject) => {
     const child = spawn(
-      "ob",
+      OB_BIN,
       [
         "sync",
         "--path",
@@ -407,7 +430,7 @@ function shutdown(signal) {
       }
 
       finish();
-    }, 8000);
+    }, 4000);
 
     syncProcess.on("exit", () => {
       clearTimeout(force);
