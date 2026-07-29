@@ -33,10 +33,11 @@ const PORT = process.env.PORT || 3000;
 const VAULT_PATH = process.env.VAULT_PATH || "/data/vault";
 
 const INBOX_RELATIVE_PATH =
-  process.env.INBOX_PATH || path.join("00 Inbox", "AI Inbox.md");
+  process.env.INBOX_PATH ||
+  path.join("00. Inbox", "AI Inbox.md");
 
 const PROJECTS_RELATIVE_PATH =
-  process.env.PROJECTS_PATH || "01 Projects";
+  process.env.PROJECTS_PATH || "01. Projects";
 
 const TIME_ZONE =
   process.env.TIME_ZONE || "America/New_York";
