@@ -2,6 +2,8 @@ const express = require("express");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
+const crypto = require("crypto");
+const Anthropic = require("@anthropic-ai/sdk");
 const { spawn, execFileSync } = require("child_process");
 
 /*
@@ -27,7 +29,19 @@ const OB_BIN = (() => {
 })();
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+
+/*
+ Slack signs the raw request body, so keep a copy before
+ express.json() consumes it.
+*/
+app.use(
+  express.json({
+    limit: "1mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf.toString("utf8");
+    },
+  })
+);
 
 const PORT = process.env.PORT || 3000;
 const VAULT_PATH = process.env.VAULT_PATH || "/data/vault";
@@ -1042,6 +1056,502 @@ async function fileCapture(body) {
 }
 
 /* =========================================================
+   Slack capture
+   ========================================================= */
+
+const SLACK_TODO_CHANNEL =
+  process.env.SLACK_TODO_CHANNEL || null;
+
+const anthropic = new Anthropic();
+
+/*
+ Slack retries an event if we're slow or return non-2xx.
+ Remember recent event IDs so a retry can't file twice.
+*/
+const seenSlackEvents = new Set();
+
+function alreadyHandled(eventId) {
+  if (!eventId) {
+    return false;
+  }
+
+  if (seenSlackEvents.has(eventId)) {
+    return true;
+  }
+
+  seenSlackEvents.add(eventId);
+
+  if (seenSlackEvents.size > 500) {
+    const oldest = seenSlackEvents
+      .values()
+      .next().value;
+
+    seenSlackEvents.delete(oldest);
+  }
+
+  return false;
+}
+
+function verifySlackSignature(req, res, next) {
+  const secret =
+    process.env.SLACK_SIGNING_SECRET;
+
+  if (!secret) {
+    return res.status(503).json({
+      success: false,
+      error:
+        "SLACK_SIGNING_SECRET not configured",
+    });
+  }
+
+  const timestamp = req.get(
+    "x-slack-request-timestamp"
+  );
+
+  const signature = req.get(
+    "x-slack-signature"
+  );
+
+  if (!timestamp || !signature) {
+    return res
+      .status(401)
+      .send("Missing Slack signature");
+  }
+
+  /*
+   Reject replays of an old, captured request.
+  */
+  const ageSeconds = Math.abs(
+    Date.now() / 1000 -
+      Number(timestamp)
+  );
+
+  if (
+    !Number.isFinite(ageSeconds) ||
+    ageSeconds > 60 * 5
+  ) {
+    return res
+      .status(401)
+      .send("Stale Slack request");
+  }
+
+  const expected =
+    "v0=" +
+    crypto
+      .createHmac("sha256", secret)
+      .update(
+        `v0:${timestamp}:${
+          req.rawBody || ""
+        }`
+      )
+      .digest("hex");
+
+  const a = Buffer.from(expected);
+  const b = Buffer.from(signature);
+
+  if (
+    a.length !== b.length ||
+    !crypto.timingSafeEqual(a, b)
+  ) {
+    return res
+      .status(401)
+      .send("Bad Slack signature");
+  }
+
+  next();
+}
+
+const SLACK_API_BASE =
+  process.env.SLACK_API_BASE ||
+  "https://slack.com/api";
+
+async function slackApi(method, body) {
+  const token =
+    process.env.SLACK_BOT_TOKEN;
+
+  if (!token) {
+    return null;
+  }
+
+  try {
+    const response = await fetch(
+      `${SLACK_API_BASE}/${method}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type":
+            "application/json; charset=utf-8",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(body),
+      }
+    );
+
+    const data = await response.json();
+
+    if (!data.ok) {
+      console.error(
+        `[slack] ${method} failed:`,
+        data.error
+      );
+    }
+
+    return data;
+  } catch (error) {
+    console.error(
+      `[slack] ${method} threw:`,
+      error.message
+    );
+
+    return null;
+  }
+}
+
+const slackUserNames = new Map();
+
+async function resolveSlackUser(userId) {
+  if (!userId) {
+    return null;
+  }
+
+  if (slackUserNames.has(userId)) {
+    return slackUserNames.get(userId);
+  }
+
+  const data = await slackApi(
+    "users.info",
+    { user: userId }
+  );
+
+  const profile =
+    data && data.ok
+      ? data.user.profile
+      : null;
+
+  const name =
+    (profile &&
+      (profile.display_name ||
+        profile.real_name)) ||
+    null;
+
+  slackUserNames.set(userId, name);
+
+  return name;
+}
+
+/*
+ Slack wraps links and mentions in angle brackets and
+ escapes a few entities. Undo that so the model reads
+ what the human actually typed.
+*/
+function normalizeSlackText(text) {
+  return String(text || "")
+    .replace(
+      /<([a-z]+:[^|>]+)\|([^>]+)>/gi,
+      "$2"
+    )
+    .replace(
+      /<([a-z]+:[^|>]+)>/gi,
+      "$1"
+    )
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .trim();
+}
+
+async function listProjectNames() {
+  const dir = path.join(
+    VAULT_PATH,
+    PROJECTS_RELATIVE_PATH
+  );
+
+  try {
+    const entries = await fs.readdir(dir);
+
+    return entries
+      .filter((name) =>
+        name.endsWith(".md")
+      )
+      .map((name) =>
+        name.replace(/\.md$/, "")
+      );
+  } catch {
+    return [];
+  }
+}
+
+const CAPTURE_SCHEMA = {
+  type: "object",
+  properties: {
+    classification: {
+      type: "string",
+      enum: [
+        "action",
+        "waiting",
+        "reference",
+        "none",
+      ],
+    },
+    project: {
+      type: "string",
+      description:
+        "Existing project name if it matches one, otherwise a new short project name, otherwise empty.",
+    },
+    next_actions_markdown: {
+      type: "string",
+      description:
+        "Zero or more lines, each '- [ ] <concrete action> #next'. Empty string if none.",
+    },
+    waiting_for_markdown: {
+      type: "string",
+      description:
+        "Zero or more lines, each '- [ ] <person> — <awaited item> #waiting'. Empty string if none.",
+    },
+    needs_review: {
+      type: "boolean",
+    },
+    review_reason: {
+      type: "string",
+    },
+    summary: {
+      type: "string",
+    },
+  },
+  required: [
+    "classification",
+    "project",
+    "next_actions_markdown",
+    "waiting_for_markdown",
+    "needs_review",
+    "review_reason",
+    "summary",
+  ],
+  additionalProperties: false,
+};
+
+async function classifySlackMessage(
+  text,
+  author
+) {
+  const projects =
+    await listProjectNames();
+
+  const system = [
+    "You turn short Slack messages into GTD items for Evan Kleiman.",
+    "Colleagues post to a channel where every message is a to-do for Evan.",
+    "",
+    "Rules:",
+    "- Next actions are concrete things EVAN does. Each line ends with #next.",
+    "- Waiting-for items are things Evan is blocked on someone else for. Each line ends with #waiting.",
+    "- Prefer an existing project name over inventing a near-duplicate.",
+    "- Leave project empty when nothing fits and no sensible project exists.",
+    "- A Slack one-liner carries far less context than an email thread. Set",
+    "  needs_review true whenever the ask, the owner, or the project is unclear,",
+    "  so it stays in the inbox instead of creating a wrong project.",
+    "- summary is one sentence of context, not a restatement of the task.",
+    "",
+    projects.length
+      ? `Existing projects:\n${projects
+          .map((p) => `- ${p}`)
+          .join("\n")}`
+      : "There are no existing projects yet.",
+  ].join("\n");
+
+  const response =
+    await anthropic.messages.create({
+      model: "claude-opus-5",
+      max_tokens: 16000,
+      system,
+      output_config: {
+        effort: "medium",
+        format: {
+          type: "json_schema",
+          schema: CAPTURE_SCHEMA,
+        },
+      },
+      messages: [
+        {
+          role: "user",
+          content: `Slack message from ${
+            author || "a colleague"
+          }:\n\n${text}`,
+        },
+      ],
+    });
+
+  if (
+    response.stop_reason === "refusal"
+  ) {
+    throw new Error(
+      "Classifier declined this message"
+    );
+  }
+
+  const block = response.content.find(
+    (b) => b.type === "text"
+  );
+
+  if (!block) {
+    throw new Error(
+      "Classifier returned no text block"
+    );
+  }
+
+  return JSON.parse(block.text);
+}
+
+/*
+ Note who asked, so a task still makes sense days later.
+*/
+function attributeTaskLines(
+  markdown,
+  author
+) {
+  const value = clean(markdown);
+
+  if (!value || !author) {
+    return value || "";
+  }
+
+  return value
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trim();
+
+      if (!trimmed.startsWith("- [ ]")) {
+        return trimmed;
+      }
+
+      return trimmed.includes(
+        `(@${author})`
+      )
+        ? trimmed
+        : `${trimmed} (@${author})`;
+    })
+    .join("\n");
+}
+
+async function handleSlackEvent(body) {
+  if (
+    body.type !== "event_callback"
+  ) {
+    return;
+  }
+
+  const event = body.event || {};
+
+  /*
+   Only plain human messages. Skip bots, edits,
+   joins, and replies inside a thread so discussion
+   about a task doesn't create more tasks.
+  */
+  if (
+    event.type !== "message" ||
+    event.bot_id ||
+    event.subtype ||
+    (event.thread_ts &&
+      event.thread_ts !== event.ts)
+  ) {
+    return;
+  }
+
+  if (
+    SLACK_TODO_CHANNEL &&
+    event.channel !== SLACK_TODO_CHANNEL
+  ) {
+    return;
+  }
+
+  if (alreadyHandled(body.event_id)) {
+    console.log(
+      "[slack] Duplicate delivery ignored:",
+      body.event_id
+    );
+
+    return;
+  }
+
+  const text = normalizeSlackText(
+    event.text
+  );
+
+  if (!text) {
+    return;
+  }
+
+  const author = await resolveSlackUser(
+    event.user
+  );
+
+  console.log(
+    `[slack] Capturing from ${
+      author || event.user
+    }: ${text.slice(0, 120)}`
+  );
+
+  const ready = await waitForSync(
+    CAPTURE_SYNC_WAIT_MS
+  );
+
+  if (!ready) {
+    await slackApi(
+      "chat.postMessage",
+      {
+        channel: event.channel,
+        thread_ts: event.ts,
+        text: "⚠️ Obsidian Sync isn't ready — this one wasn't filed. Please re-post it.",
+      }
+    );
+
+    return;
+  }
+
+  const parsed =
+    await classifySlackMessage(
+      text,
+      author
+    );
+
+  const payload = {
+    ...parsed,
+    next_actions_markdown:
+      attributeTaskLines(
+        parsed.next_actions_markdown,
+        author
+      ),
+    waiting_for_markdown:
+      attributeTaskLines(
+        parsed.waiting_for_markdown,
+        author
+      ),
+    summary: author
+      ? `${parsed.summary} (via @${author} in Slack)`
+      : parsed.summary,
+  };
+
+  const result = await fileCapture(
+    payload
+  );
+
+  console.log(
+    "[slack] Filed:",
+    result
+  );
+
+  await slackApi("chat.postMessage", {
+    channel: event.channel,
+    thread_ts: event.ts,
+    text: result.project
+      ? `✅ Filed to *${result.project}* → Next Actions`
+      : `📥 Kept in the AI Inbox for Evan to triage (${result.reason.replace(
+          "_",
+          " "
+        )})`,
+  });
+}
+
+/* =========================================================
    Routes
    ========================================================= */
 
@@ -1057,6 +1567,51 @@ app.get(
       sync_error:
         syncError,
     });
+  }
+);
+
+app.post(
+  "/slack",
+  verifySlackSignature,
+  async (req, res) => {
+    const body = req.body || {};
+
+    if (
+      body.type === "url_verification"
+    ) {
+      return res
+        .status(200)
+        .send(body.challenge);
+    }
+
+    /*
+     Slack wants an ack within 3 seconds, and
+     classification plus filing takes longer than
+     that. Ack first, then do the work.
+    */
+    res.status(200).end();
+
+    try {
+      await handleSlackEvent(body);
+    } catch (error) {
+      console.error(
+        "[slack] Capture failed:",
+        error
+      );
+
+      const event = body.event || {};
+
+      if (event.channel && event.ts) {
+        await slackApi(
+          "chat.postMessage",
+          {
+            channel: event.channel,
+            thread_ts: event.ts,
+            text: `⚠️ Couldn't file that one: ${error.message}`,
+          }
+        );
+      }
+    }
   }
 );
 
